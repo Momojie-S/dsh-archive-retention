@@ -1,0 +1,14 @@
+# @momojie-s/dsh-archive-retention 组合包 patch 层：被 profile bundles 列表引用时应用。
+# 宿主半部注册 archive-retention 设置命名空间 + cron 定时清扫；客户端半部渲染
+# 设置页（插件 → 可配置）里的归档清理卡片。以下为组合层默认值，页面改动
+# 存进设置存储的用户层，优先级高于这里。
+- insert:
+    - id: archive-retention
+      name: '@momojie-s/dsh-archive-retention'
+      config:
+        enabled: true              # 总开关
+        retentionValue: 7          # 保留期数值
+        retentionUnit: days        # 保留期单位: days | hours
+        cleanSessionsArchive: true # 清理 sessions-archive 物理归档堆
+        cleanGuiArchived: true     # 清理页面归档(GUI 归档名单)的会话记录
+        sweepCron: '0 4 * * *'     # 清扫节奏(cron): 默认每天 04:00 一次
