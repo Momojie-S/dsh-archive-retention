@@ -34,15 +34,36 @@ import type { parseExpression } from 'cron-parser'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-timer' // ctx.interval
 import z from '@deepseek-ai/schemastery'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-workspace' // ctx.workspaceRegistry type merge
 import type {} from '@deepseek-ai/dsh-session' // ctx.sessions type merge
 
 export const name = 'dsh-archive-retention'
-export const inject = ['timer', 'workspaceRegistry', 'sessions']
+export const inject = ['timer', 'workspaceRegistry', 'sessions', 'settings']
 
-/** Page-editable settings namespace. */
-export const SETTINGS_NS = settingsNamespace('archive-retention')
+/**
+ * Page-editable settings namespace. 0.1.2-rc.1 dropped the
+ * `settingsNamespace` brand helper — namespaces are now plain
+ * lowercase-kebab strings validated by the settings service.
+ */
+export const SETTINGS_NS = 'archive-retention'
+
+/**
+ * Structural face of the settings service's `installSection` method
+ * (0.1.2-rc.1). The locally installed `@deepseek-ai/dsh-settings` is still
+ * 0.1.1-rc.2, whose `SettingsProvider` only declares the removed free
+ * function — this bridge lets the plugin compile here while calling the
+ * service method that exists at runtime on 0.1.2-rc.1+.
+ */
+interface SettingsSectionInstaller {
+  installSection<const NS extends string, T>(
+    owner: Context,
+    ns: NS,
+    schema: z<T>,
+    entry: T,
+    hooks: { setSource(current: () => T): void; onChange(): void },
+  ): void
+}
 
 /** Default sweep schedule: once a day at 04:00. */
 export const DEFAULT_SWEEP_CRON = '0 4 * * *'
@@ -218,7 +239,9 @@ export function apply(ctx: Context, config: Config): void {
   let current: () => Config = () => config
 
   // Page edits land in the settings store; the sweep reads `current()` each run.
-  installSettingsSection(ctx, SETTINGS_NS, Config, config, {
+  // 0.1.2-rc.1 removed the `installSettingsSection` free function; the wiring
+  // now goes through the settings service's `installSection` method.
+  ;(ctx.settings as unknown as SettingsSectionInstaller).installSection(ctx, SETTINGS_NS, Config, config, {
     setSource: (source) => { current = source },
     onChange: () => {
       const c = current()
