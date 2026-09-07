@@ -2,7 +2,7 @@
  * Archive retention (`dsh-archive-retention`): periodic physical cleanup of
  * archived conversation records with a page-configurable retention window.
  *
- * Two cleanup scopes, both opt-out:
+ * Three cleanup scopes, all opt-out:
  * 1. `sessions-archive/` — the physical archive pile (manual archives land
  *    here). Dirs whose latest artifact write predates the retention window
  *    are deleted.
@@ -11,6 +11,14 @@
  *    `session.list`; after the retention window the record is physically
  *    deleted, making the archive a grace period rather than a forever-pile.
  *    Attached (in-memory) sessions are never touched, whatever their age.
+ * 3. Orphaned subagent directories — subagent session dirs under `sessions/`
+ *    whose `parentSession` no longer resolves to any session directory on
+ *    disk (the parent was deleted by scopes 1/2, a manual cleanup, or
+ *    anything else). The UI offers no way to archive these dirs, so without
+ *    this scope they accumulate forever and re-inflate `session.list`.
+ *    Children of a parent deleted in this sweep are picked up in the same
+ *    pass; a parent still on disk (grace period) keeps its children until
+ *    the parent physically goes.
  *
  * Retention knobs live in the `archive-retention` settings namespace, edited
  * from the web Settings → 插件 page card (host half registers the section via
@@ -25,10 +33,11 @@
  * @module @momojie-s/dsh-archive-retention
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { zstdDecompressSync } from 'node:zlib'
 import cronParser from 'cron-parser'
 import type { parseExpression } from 'cron-parser'
 import type { Context } from '@deepseek-ai/cordis'
@@ -79,6 +88,12 @@ export interface Config {
   cleanSessionsArchive?: boolean
   /** Physically delete page-archived (GUI archive set) session records past retention (default true). */
   cleanGuiArchived?: boolean
+  /**
+   * Physically delete orphaned subagent directories past retention: subagent
+   * dirs whose `parentSession` no longer resolves to any session directory on
+   * disk (default true).
+   */
+  cleanOrphanSubagents?: boolean
   /** 5-field cron expression driving the sweep (default `0 4 * * *` — daily 04:00). */
   sweepCron?: string
 }
@@ -89,6 +104,7 @@ export const Config: z<Config> = z.object({
   retentionUnit: z.union(['days', 'hours']).default('days'),
   cleanSessionsArchive: z.boolean().default(true),
   cleanGuiArchived: z.boolean().default(true),
+  cleanOrphanSubagents: z.boolean().default(true),
   sweepCron: z.string().default(DEFAULT_SWEEP_CRON),
 })
 
@@ -135,7 +151,7 @@ export interface RetentionCandidate {
   readonly attached: boolean
 }
 
-export type RetentionSkipReason = 'empty-dir' | 'attached' | 'within-retention'
+export type RetentionSkipReason = 'empty-dir' | 'attached' | 'within-retention' | 'parent-alive'
 
 export interface RetentionPlanEntry {
   readonly id: string
@@ -154,6 +170,32 @@ export function planRetention(candidates: readonly RetentionCandidate[], nowMs: 
     if (candidate.lastWriteMs === undefined) return { id: candidate.id, eligible: false, skipReason: 'empty-dir' as const }
     if (candidate.lastWriteMs >= cutoffMs) return { id: candidate.id, eligible: false, skipReason: 'within-retention' as const }
     void nowMs
+    return { id: candidate.id, eligible: true, skipReason: undefined }
+  })
+}
+
+/** One orphan-subagent candidate: a session dir whose header names a parent. */
+export interface OrphanCandidate {
+  readonly id: string
+  /** Session id of the parent recorded in the dir's header. */
+  readonly parentSession: string
+  readonly lastWriteMs: number | undefined
+  readonly attached: boolean
+}
+
+/**
+ * Decide orphan-subagent eligibility, pure and total: a subagent directory
+ * goes when its parent no longer exists on disk (`existingIds` — directory
+ * names are session ids) and its latest write predates `cutoffMs`. A parent
+ * still on disk keeps its children whatever their age; the parent's own
+ * scopes decide when the family goes.
+ */
+export function planOrphans(candidates: readonly OrphanCandidate[], existingIds: ReadonlySet<string>, cutoffMs: number): RetentionPlanEntry[] {
+  return candidates.map(candidate => {
+    if (candidate.attached) return { id: candidate.id, eligible: false, skipReason: 'attached' as const }
+    if (candidate.lastWriteMs === undefined) return { id: candidate.id, eligible: false, skipReason: 'empty-dir' as const }
+    if (candidate.lastWriteMs >= cutoffMs) return { id: candidate.id, eligible: false, skipReason: 'within-retention' as const }
+    if (existingIds.has(candidate.parentSession)) return { id: candidate.id, eligible: false, skipReason: 'parent-alive' as const }
     return { id: candidate.id, eligible: true, skipReason: undefined }
   })
 }
@@ -209,10 +251,29 @@ async function stillQuiescent(dir: string, plannedLastWriteMs: number | undefine
   }
 }
 
+/**
+ * Read { id, parentSession } from a session dir's zstd JSONL header.
+ * Undefined on any failure — callers must treat unreadable headers as
+ * "no parent information" and never delete on that basis.
+ */
+function readSessionHeader(dir: string): { parentSession?: string } | undefined {
+  try {
+    const artifact = join(dir, 'session.jsonl.zstd')
+    if (!existsSync(artifact)) return undefined
+    const firstLine = zstdDecompressSync(readFileSync(artifact)).toString('utf8').split('\n')[0]
+    const header = JSON.parse(firstLine)
+    if (typeof header !== 'object' || header === null) return undefined
+    return { parentSession: typeof header.parentSession === 'string' ? header.parentSession : undefined }
+  } catch {
+    return undefined
+  }
+}
+
 interface SweepOutcome {
   enabled: boolean
   scannedArchiveDir: number
   scannedGuiArchived: number
+  scannedOrphans: number
   deleted: number
   freedBytes: number
   failures: number
@@ -234,6 +295,7 @@ export function apply(ctx: Context, config: Config): void {
     retentionUnit: c.retentionUnit ?? 'days',
     cleanSessionsArchive: c.cleanSessionsArchive ?? true,
     cleanGuiArchived: c.cleanGuiArchived ?? true,
+    cleanOrphanSubagents: c.cleanOrphanSubagents ?? true,
     sweepCron: c.sweepCron ?? DEFAULT_SWEEP_CRON,
   })
   let current: () => Config = () => config
@@ -274,7 +336,7 @@ export function apply(ctx: Context, config: Config): void {
 
   async function sweep(): Promise<SweepOutcome> {
     const outcome: SweepOutcome = {
-      enabled: false, scannedArchiveDir: 0, scannedGuiArchived: 0, deleted: 0,
+      enabled: false, scannedArchiveDir: 0, scannedGuiArchived: 0, scannedOrphans: 0, deleted: 0,
       freedBytes: 0, failures: 0, failureDetails: [], skippedAttached: 0, manifestPath: null,
     }
     const cfg = withDefaults(current())
@@ -344,6 +406,59 @@ export function apply(ctx: Context, config: Config): void {
         } catch (error) {
           outcome.failures += 1
           outcome.failureDetails.push(`${id}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+    }
+
+    // ---- scope 3: orphaned subagent directories ----
+    // A subagent dir whose parentSession no longer resolves to any session
+    // directory on disk. Parents deleted in scopes 1/2 of this same sweep are
+    // already absent here, so their children go in the same pass; a parent
+    // still inside its grace period keeps its children until it physically
+    // goes. Unreadable headers mean "no parent information": never delete.
+    if (cfg.cleanOrphanSubagents) {
+      let workspaces: string[] = []
+      try {
+        workspaces = (await readdir(sessionsRoot, { withFileTypes: true })).filter(e => e.isDirectory()).map(e => e.name)
+      } catch { /* no sessions root yet */ }
+      const existing = new Set<string>()
+      const dirs: { ws: string; path: string; name: string }[] = []
+      for (const ws of workspaces) {
+        let names: string[] = []
+        try {
+          names = (await readdir(join(sessionsRoot, ws), { withFileTypes: true })).filter(e => e.isDirectory()).map(e => e.name)
+        } catch { continue }
+        for (const name of names) {
+          existing.add(name)
+          dirs.push({ ws, path: join(sessionsRoot, ws, name), name })
+        }
+      }
+      for (const entry of dirs) {
+        if (registry.sessions.get(entry.name) !== undefined) { outcome.skippedAttached += 1; continue }
+        const probe = await probeDir(entry.path)
+        const [cold] = planRetention(
+          [{ id: entry.name, scope: 'archive-dir', lastWriteMs: probe.lastWriteMs, attached: false }],
+          now, cutoff,
+        )
+        if (cold.eligible !== true) continue // warm dirs skip the header read entirely
+        const header = readSessionHeader(entry.path)
+        const parent = header?.parentSession
+        if (typeof parent !== 'string' || parent.length === 0) continue
+        outcome.scannedOrphans += 1
+        const [verdict] = planOrphans(
+          [{ id: entry.name, parentSession: parent, lastWriteMs: probe.lastWriteMs, attached: false }],
+          existing, cutoff,
+        )
+        if (verdict.eligible !== true) continue
+        if (!(await stillQuiescent(entry.path, probe.lastWriteMs))) continue
+        try {
+          await rm(entry.path, { recursive: true, force: true })
+          outcome.deleted += 1
+          outcome.freedBytes += probe.sizeBytes
+          deletedList.push({ id: entry.name, from: join('sessions', entry.ws), sizeBytes: probe.sizeBytes })
+        } catch (error) {
+          outcome.failures += 1
+          outcome.failureDetails.push(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
     }

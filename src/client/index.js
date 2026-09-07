@@ -103,6 +103,7 @@ function apply(ctx) {  const scope = ctx.settingsScope.bind({ namespace: NS })
     const unitFld = effective('retentionUnit')
     const cleanArchive = effective('cleanSessionsArchive')
     const cleanGui = effective('cleanGuiArchived')
+    const cleanOrphans = effective('cleanOrphanSubagents')
     const cronFld = effective('sweepCron')
     const disabled = !s.writable || s.saving
     const checkbox = (field, checked, label, hint) => h('label', { style: { ...rowStyle, cursor: disabled ? 'default' : 'pointer' } },
@@ -146,6 +147,7 @@ function apply(ctx) {  const scope = ctx.settingsScope.bind({ namespace: NS })
       ),
       checkbox('cleanSessionsArchive', cleanArchive.value, '清理物理归档堆', 'sessions-archive 里超期的归档目录'),
       checkbox('cleanGuiArchived', cleanGui.value, '清理页面归档的会话', '页面上归档的会话满保留期后物理删除'),
+      checkbox('cleanOrphanSubagents', cleanOrphans.value, '清理孤儿子 agent', '父会话已删除的超期子 agent 目录一并删除'),
       h('div', { style: rowStyle },
         h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
           '清扫节奏(cron)',

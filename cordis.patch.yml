@@ -11,4 +11,5 @@
         retentionUnit: days        # 保留期单位: days | hours
         cleanSessionsArchive: true # 清理 sessions-archive 物理归档堆
         cleanGuiArchived: true     # 清理页面归档(GUI 归档名单)的会话记录
+        cleanOrphanSubagents: true # 清理孤儿子 agent(父会话目录已消失的超期子 agent 目录)
         sweepCron: '0 4 * * *'     # 清扫节奏(cron): 默认每天 04:00 一次
