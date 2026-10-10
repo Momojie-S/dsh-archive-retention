@@ -20,10 +20,11 @@
  *    pass; a parent still on disk (grace period) keeps its children until
  *    the parent physically goes.
  *
- * Retention knobs live in the `archive-retention` settings namespace, edited
- * from the web Settings → 插件 page card (host half registers the section via
- * installSettingsSection; client half renders the card into the
- * `settings.plugin.item` slot).
+ * Retention knobs are volatile Config fields (dsh 0.2.0 immediate config
+ * forms): each is declared `.volatile()` in the schema and edited from the
+ * web Plugins page form of this bundle's entry; page edits persist in the
+ * settings store and apply live via the config editor's HMR, no client half
+ * and no settings-namespace registration needed.
  *
  * Safety rails carried over from the validated manual practice
  * (2026-08-26, 505 dirs / 627MB, zero incidents): per-directory re-check of
@@ -40,72 +41,47 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { zstdDecompressSync } from 'node:zlib'
 import cronParser from 'cron-parser'
 import type { parseExpression } from 'cron-parser'
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-timer' // ctx.interval
 import z from '@deepseek-ai/schemastery'
-import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-workspace' // ctx.workspaceRegistry type merge
 import type {} from '@deepseek-ai/dsh-session' // ctx.sessions type merge
 
 export const name = 'dsh-archive-retention'
-export const inject = ['timer', 'workspaceRegistry', 'sessions', 'settings']
-
-/**
- * Page-editable settings namespace. 0.1.2-rc.1 dropped the
- * `settingsNamespace` brand helper — namespaces are now plain
- * lowercase-kebab strings validated by the settings service.
- */
-export const SETTINGS_NS = 'archive-retention'
-
-/**
- * Structural face of the settings service's `installSection` method
- * (0.1.2-rc.1). The locally installed `@deepseek-ai/dsh-settings` is still
- * 0.1.1-rc.2, whose `SettingsProvider` only declares the removed free
- * function — this bridge lets the plugin compile here while calling the
- * service method that exists at runtime on 0.1.2-rc.1+.
- */
-interface SettingsSectionInstaller {
-  installSection<const NS extends string, T>(
-    owner: Context,
-    ns: NS,
-    schema: z<T>,
-    entry: T,
-    hooks: { setSource(current: () => T): void; onChange(): void },
-  ): void
-}
+export const inject = ['timer', 'workspaceRegistry', 'sessions']
 
 /** Default sweep schedule: once a day at 04:00. */
 export const DEFAULT_SWEEP_CRON = '0 4 * * *'
 
 export interface Config {
   /** Master switch for the periodic sweep (default true). */
-  enabled?: boolean
+  enabled: Volatile<boolean | undefined>
   /** Retention amount; pairs with `retentionUnit` (default 7). */
-  retentionValue?: number
+  retentionValue: Volatile<number | undefined>
   /** Retention unit: `days` (default) or `hours`. */
-  retentionUnit?: 'days' | 'hours'
+  retentionUnit: Volatile<'days' | 'hours' | undefined>
   /** Sweep the physical `sessions-archive/` pile (default true). */
-  cleanSessionsArchive?: boolean
+  cleanSessionsArchive: Volatile<boolean | undefined>
   /** Physically delete page-archived (GUI archive set) session records past retention (default true). */
-  cleanGuiArchived?: boolean
+  cleanGuiArchived: Volatile<boolean | undefined>
   /**
    * Physically delete orphaned subagent directories past retention: subagent
    * dirs whose `parentSession` no longer resolves to any session directory on
    * disk (default true).
    */
-  cleanOrphanSubagents?: boolean
+  cleanOrphanSubagents: Volatile<boolean | undefined>
   /** 5-field cron expression driving the sweep (default `0 4 * * *` — daily 04:00). */
-  sweepCron?: string
+  sweepCron: Volatile<string | undefined>
 }
 
-export const Config: z<Config> = z.object({
-  enabled: z.boolean().default(true),
-  retentionValue: z.number().min(1).default(7),
-  retentionUnit: z.union(['days', 'hours']).default('days'),
-  cleanSessionsArchive: z.boolean().default(true),
-  cleanGuiArchived: z.boolean().default(true),
-  cleanOrphanSubagents: z.boolean().default(true),
-  sweepCron: z.string().default(DEFAULT_SWEEP_CRON),
+export const Config = z.object({
+  enabled: z.boolean().default(true).volatile(),
+  retentionValue: z.number().min(1).default(7).volatile(),
+  retentionUnit: z.union(['days', 'hours']).default('days').volatile(),
+  cleanSessionsArchive: z.boolean().default(true).volatile(),
+  cleanGuiArchived: z.boolean().default(true).volatile(),
+  cleanOrphanSubagents: z.boolean().default(true).volatile(),
+  sweepCron: z.string().default(DEFAULT_SWEEP_CRON).volatile(),
 })
 
 /** Convert a retention amount + unit into milliseconds. */
@@ -287,9 +263,25 @@ export function apply(ctx: Context, config: Config): void {
   const archiveRoot = join(home, 'sessions-archive')
   const sessionsRoot = join(home, 'sessions')
 
-  // The settings section's source is a thunk returning the resolved section;
-  // normalize optionality with defaults for the sweep's reads.
-  const withDefaults = (c: Config): Required<Config> => ({
+  // Resolved (defaults applied) shape of the volatile Config fields.
+  interface ResolvedConfig {
+    enabled: boolean
+    retentionValue: number
+    retentionUnit: 'days' | 'hours'
+    cleanSessionsArchive: boolean
+    cleanGuiArchived: boolean
+    cleanOrphanSubagents: boolean
+    sweepCron: string
+  }
+  const withDefaults = (c: {
+    enabled?: boolean
+    retentionValue?: number
+    retentionUnit?: 'days' | 'hours'
+    cleanSessionsArchive?: boolean
+    cleanGuiArchived?: boolean
+    cleanOrphanSubagents?: boolean
+    sweepCron?: string
+  }): ResolvedConfig => ({
     enabled: c.enabled ?? true,
     retentionValue: c.retentionValue ?? 7,
     retentionUnit: c.retentionUnit ?? 'days',
@@ -298,20 +290,18 @@ export function apply(ctx: Context, config: Config): void {
     cleanOrphanSubagents: c.cleanOrphanSubagents ?? true,
     sweepCron: c.sweepCron ?? DEFAULT_SWEEP_CRON,
   })
-  let current: () => Config = () => config
 
-  // Page edits land in the settings store; the sweep reads `current()` each run.
-  // 0.1.2-rc.1 removed the `installSettingsSection` free function; the wiring
-  // now goes through the settings service's `installSection` method.
-  ;(ctx.settings as unknown as SettingsSectionInstaller).installSection(ctx, SETTINGS_NS, Config, config, {
-    setSource: (source) => { current = source },
-    onChange: () => {
-      const c = current()
-      ctx.logger.info(
-        `archive-retention: settings updated (enabled=${c.enabled}, retention=${c.retentionValue}${c.retentionUnit === 'hours' ? 'h' : 'd'}, ` +
-        `archiveDir=${c.cleanSessionsArchive}, guiArchived=${c.cleanGuiArchived})`,
-      )
-    },
+  // The Plugins-page form edits land in the settings store and apply live
+  // (config-editor volatile HMR); every sweep and the ticker read the
+  // volatile getters fresh, so no cached copy is kept.
+  const current = (): ResolvedConfig => withDefaults({
+    enabled: config.enabled.get(),
+    retentionValue: config.retentionValue.get(),
+    retentionUnit: config.retentionUnit.get(),
+    cleanSessionsArchive: config.cleanSessionsArchive.get(),
+    cleanGuiArchived: config.cleanGuiArchived.get(),
+    cleanOrphanSubagents: config.cleanOrphanSubagents.get(),
+    sweepCron: config.sweepCron.get(),
   })
 
   const registry = ctx as unknown as {
@@ -504,8 +494,8 @@ export function apply(ctx: Context, config: Config): void {
     }).finally(() => { sweeping = false })
   }, 30_000)
 
-  const active = withDefaults(current())
+  const active = current()
   ctx.logger.info(
-    `archive-retention: active (retention ${active.retentionValue}${active.retentionUnit === 'hours' ? 'h' : 'd'}, cron "${active.sweepCron}", ns "${String(SETTINGS_NS)}")`,
+    `archive-retention: active (retention ${active.retentionValue}${active.retentionUnit === 'hours' ? 'h' : 'd'}, cron "${active.sweepCron}", volatile config)`,
   )
 }

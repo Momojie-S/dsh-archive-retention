@@ -1,8 +1,8 @@
 /**
- * Atomic build orchestrator: host half (tsc) + client bundle (concatenation)
- * both land in a staging directory first, and only a fully successful build
- * swaps `lib/` in one rename pair. Template copied from
- * plugins/dsh-workspace-files/scripts/build.mjs (dual-half plugin).
+ * Atomic build orchestrator: the host half (tsc) lands in a staging directory
+ * first, and only a fully successful build swaps `lib/` in one rename pair.
+ * The client half was removed with the 0.2.0 settings migration: volatile
+ * Config fields render on the Plugins page form, so this plugin is host-only.
  */
 import { execSync } from 'node:child_process'
 import { readFile, writeFile, rm, rename, readdir } from 'node:fs/promises'
@@ -70,7 +70,7 @@ if (typeof staged.apply !== 'function') {
   throw new Error('build gate: staged lib/index.js has no apply export — refusing to swap')
 }
 
-// ---- 4. atomic-ish swap ----
+// ---- 3. atomic-ish swap ----
 const liveExists = await readdir(live).then(() => true, () => false)
 if (liveExists) {
   await rm(retired, { recursive: true, force: true })
