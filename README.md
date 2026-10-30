@@ -8,7 +8,7 @@ DSH 插件:**归档会话定期清理**——物理归档堆(`sessions-archive/`
 
 ## 环境要求
 
-- DSH `>= 0.2.0-rc.2`(已验证至 `0.2.0-rc.2`;设置走 volatile Config + 插件页表单,需 web profile);Windows/Linux/macOS
+- DSH `>= 0.2.0-rc.2`(已验证至 `0.2.1-rc.5`;设置走 volatile Config + 插件页表单,需 web profile);Windows/Linux/macOS
 - 宿主+客户端双半部 bundle 插件
 
 ## 用法
