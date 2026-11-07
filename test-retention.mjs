@@ -1,9 +1,13 @@
 /**
- * Pure-function unit tests for the retention planning core.
+ * Unit tests for the retention planning core and journal-header helpers.
  * Run: node test-retention.mjs  (imports the compiled lib/)
  */
 import assert from 'node:assert/strict'
-import { planRetention, planOrphans, retentionToMs, cronDueSince, isPlausibleCron } from './lib/index.js'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { zstdCompressSync } from 'node:zlib'
+import { planRetention, planOrphans, retentionToMs, cronDueSince, isPlausibleCron, journalGeneration, pickSessionJournal, readSessionHeader } from './lib/index.js'
 
 let passed = 0
 function check(name, fn) {
@@ -128,6 +132,73 @@ check('orphan without files is skipped (empty-dir)', () => {
   )
   assert.equal(e.eligible, false)
   assert.equal(e.skipReason, 'empty-dir')
+})
+
+console.log('journalGeneration / pickSessionJournal')
+check('unversioned journal parses as generation 0', () => {
+  assert.equal(journalGeneration('session.jsonl.zstd'), 0)
+  assert.equal(journalGeneration('session.jsonl'), 0)
+})
+check('versioned journal parses its generation', () => {
+  assert.equal(journalGeneration('session.v4.jsonl.zstd'), 4)
+  assert.equal(journalGeneration('session.v11.jsonl'), 11)
+})
+check('pick prefers the highest generation', () => {
+  assert.equal(pickSessionJournal(['session.jsonl.zstd', 'session.v4.jsonl.zstd']), 'session.v4.jsonl.zstd')
+})
+check('pick ignores unrelated files', () => {
+  assert.equal(pickSessionJournal(['session.lock', 'notes.jsonl', 'session.migration.abc.tmp']), undefined)
+})
+check('pick on gen-0 only returns it', () => {
+  assert.equal(pickSessionJournal(['session.jsonl.zstd']), 'session.jsonl.zstd')
+})
+
+console.log('readSessionHeader (fs fixtures)')
+const HEADER = JSON.stringify({ type: 'session', version: 4, id: 'sub-1', parentSession: 'session-parent-1' })
+function withTempDir(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'ar-test-'))
+  try {
+    return fn(dir)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+check('reads parentSession from a v4 zstd journal (2026-11-07 regression)', () => {
+  withTempDir((dir) => {
+    writeFileSync(join(dir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(HEADER + '\n')))
+    assert.equal(readSessionHeader(dir)?.parentSession, 'session-parent-1')
+  })
+})
+check('reads parentSession from a gen-0 zstd journal', () => {
+  withTempDir((dir) => {
+    writeFileSync(join(dir, 'session.jsonl.zstd'), zstdCompressSync(Buffer.from(HEADER + '\n')))
+    assert.equal(readSessionHeader(dir)?.parentSession, 'session-parent-1')
+  })
+})
+check('reads parentSession from an uncompressed journal', () => {
+  withTempDir((dir) => {
+    writeFileSync(join(dir, 'session.jsonl'), HEADER + '\n')
+    assert.equal(readSessionHeader(dir)?.parentSession, 'session-parent-1')
+  })
+})
+check('prefers the highest generation when several journals exist', () => {
+  withTempDir((dir) => {
+    writeFileSync(join(dir, 'session.jsonl.zstd'), zstdCompressSync(Buffer.from(JSON.stringify({ parentSession: 'old' }) + '\n')))
+    writeFileSync(join(dir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(HEADER + '\n')))
+    assert.equal(readSessionHeader(dir)?.parentSession, 'session-parent-1')
+  })
+})
+check('returns undefined when no journal matches', () => {
+  withTempDir((dir) => {
+    writeFileSync(join(dir, 'session.lock'), '')
+    assert.equal(readSessionHeader(dir), undefined)
+  })
+})
+check('main-session header without parentSession yields undefined field, not throw', () => {
+  withTempDir((dir) => {
+    writeFileSync(join(dir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(JSON.stringify({ type: 'session', id: 'm' }) + '\n')))
+    assert.equal(readSessionHeader(dir)?.parentSession, undefined)
+  })
 })
 
 console.log(`\n${passed} checks passed`)

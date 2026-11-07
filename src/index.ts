@@ -34,7 +34,7 @@
  * @module @momojie-s/dsh-archive-retention
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
@@ -216,9 +216,8 @@ async function stillQuiescent(dir: string, plannedLastWriteMs: number | undefine
   try {
     const info = await stat(dir)
     if (!info.isDirectory()) return false
-    const artifact = join(dir, 'session.jsonl.zstd')
-    if (existsSync(artifact)) {
-      const art = await stat(artifact)
+    for (const name of listSessionJournals(dir)) {
+      const art = await stat(join(dir, name))
       if (plannedLastWriteMs !== undefined && art.mtimeMs > plannedLastWriteMs) return false
     }
     return true
@@ -228,15 +227,53 @@ async function stillQuiescent(dir: string, plannedLastWriteMs: number | undefine
 }
 
 /**
+ * Session journal file names by format generation: gen 0 is `session.jsonl`
+ * (`+ .zstd` when zstd-compressed), every later generation carries its number
+ * (`session.v4.jsonl.zstd`). dsh renames journals on format migrations, so
+ * never hardcode one generation — match the pattern instead.
+ */
+const SESSION_JOURNAL_RE = /^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/
+
+/** Format generation encoded in a journal file name (0 for the unversioned one). */
+export function journalGeneration(name: string): number {
+  const match = /^session(?:\.v(\d+))?\.jsonl/.exec(name)
+  return match?.[1] !== undefined ? Number(match[1]) : 0
+}
+
+/** The current journal among candidate file names: the highest generation wins. */
+export function pickSessionJournal(names: readonly string[]): string | undefined {
+  let best: string | undefined
+  let bestGen = -1
+  for (const name of names) {
+    if (!SESSION_JOURNAL_RE.test(name)) continue
+    const gen = journalGeneration(name)
+    if (gen > bestGen) { best = name; bestGen = gen }
+  }
+  return best
+}
+
+/** Journal file names present in dir across all format generations. */
+function listSessionJournals(dir: string): string[] {
+  try {
+    return readdirSync(dir).filter(name => SESSION_JOURNAL_RE.test(name))
+  } catch {
+    return []
+  }
+}
+
+/**
  * Read { id, parentSession } from a session dir's zstd JSONL header.
  * Undefined on any failure — callers must treat unreadable headers as
  * "no parent information" and never delete on that basis.
  */
-function readSessionHeader(dir: string): { parentSession?: string } | undefined {
+export function readSessionHeader(dir: string): { parentSession?: string } | undefined {
   try {
-    const artifact = join(dir, 'session.jsonl.zstd')
-    if (!existsSync(artifact)) return undefined
-    const firstLine = zstdDecompressSync(readFileSync(artifact)).toString('utf8').split('\n')[0]
+    const journals = listSessionJournals(dir)
+    const name = pickSessionJournal(journals)
+    if (name === undefined) return undefined
+    const raw = readFileSync(join(dir, name))
+    const text = name.endsWith('.zstd') ? zstdDecompressSync(raw).toString('utf8') : raw.toString('utf8')
+    const firstLine = text.split('\n')[0]
     const header = JSON.parse(firstLine)
     if (typeof header !== 'object' || header === null) return undefined
     return { parentSession: typeof header.parentSession === 'string' ? header.parentSession : undefined }
